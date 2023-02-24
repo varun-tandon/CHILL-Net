@@ -2,3 +2,5 @@ film_reviews/*
 user_reviews/*
 venv/*
 film_reviews.zip
+runs/*
+.ipynb_checkpoints/*
