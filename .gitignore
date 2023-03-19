@@ -4,4 +4,5 @@ venv/*
 film_reviews.zip
 runs/*
 .ipynb_checkpoints/*
+models/*
 hist_NDCG/*
