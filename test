@@ -1,25 +1,170 @@
- "def embed_new_node(model, new_node_edge_index):\n",
-    "    new_node_degree = new_node_edge_index.shape[1]\n",
-    "    # get the number of nodes in the graph\n",
-    "    new_node = LightGCN.num_nodes + 1\n",
-    "    new_edges = new_node_edge_index\n",
-    "\n",
-    "    embedding_model = model.embedding\n",
-    "    # get all edges corresponding to the random items\n",
-    "    item_edges = train_graph.edge_index[:, torch.any(train_graph.edge_index[1].unsqueeze(1) == random_items, dim=1)]\n",
-    "\n",
-    "    # get the degree of each item\n",
-    "    item_degrees = item_edges[1].unique(return_counts=True)\n",
-    "    # get the random_items that do not have an edge\n",
-    "    no_edge_items = random_items[~torch.any(random_items.unsqueeze(1) == item_degrees[0], dim=1)]\n",
-    "    # drop the items in new_edges that do not have an edge\n",
-    "    new_edges = new_edges[:, torch.any(new_edges[1].unsqueeze(1) == item_degrees[0], dim=1)]\n",
-    "\n",
-    "    item_degrees = item_degrees[1]\n",
-    "    item_degrees = torch.sqrt(1 / (item_degrees * new_node_degree))\n",
-    "\n",
-    "    # get the embeddings of the random items\n",
-    "    item_embeddings = embedding_model(new_edges[1].to(device))\n",
-    "    item_degrees = torch.stack([item_degrees] * EMBEDDING_DIM, dim=1).to(device)\n",
-    "    layer_embeddings = (item_degrees * item_embeddings).sum(dim=0)\n",
-    "    return layer_embeddings"
+# Set hyperparameters
+NUM_LAYERS = 1
+LR = 2.5e-4
+BATCH_SIZE = 16
+EMBEDDING_DIM = 64
+LOAD_CHECKPOINT = False
+K = 20
+REG = 1e-4
+
+# Load model
+model = LightGCN(num_nodes=num_nodes, embedding_dim=EMBEDDING_DIM, num_layers=NUM_LAYERS, normalize=True)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+if LOAD_CHECKPOINT:
+    model.load_state_dict(torch.load(f'models/{EMBEDDING_DIM}_{NUM_LAYERS}_{1024}_{1e-3}_{num_train_users}_{143295}.pt', map_location=device))
+
+# Set up optimizer and scheduler
+optim = torch.optim.Adam(model.parameters(), lr=LR)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=0.95)
+
+# Set up training and validation data
+train_positive_edges = train_graph.edge_index[:, train_graph.edge_attr >= 3.5]
+train_negative_edges = train_graph.edge_index[:, train_graph.edge_attr <= 2.5]
+validation_df = pd.DataFrame.from_dict(validation_reviews)
+
+# Set up tensorboard
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter(comment=f'LightGCN_{EMBEDDING_DIM}_layers_{NUM_LAYERS}_batch_size_{BATCH_SIZE}_lr_{LR}_num_train_users_{num_train_users}_num_train_items_{num_train_items}_recall_{K}')
+
+for epoch in range(10001):
+    for start_idx in tqdm(range(0, num_train_users, BATCH_SIZE)):
+        model.train()
+        all_positive_rankings = torch.tensor([]).cuda()
+        all_negative_rankings = torch.tensor([]).cuda()
+        users_in_batch = torch.randperm(num_train_users)[:BATCH_SIZE]
+        for user_id in users_in_batch:
+            # get one random positive edge
+            user_positive_edges = train_positive_edges[:, train_positive_edges[0] == user_id]
+            user_negative_edges = train_negative_edges[:, train_negative_edges[0] == user_id]
+            if (user_positive_edges.shape[1] == 0 or user_negative_edges.shape[1] == 0):
+                continue
+            # randomly select a positive edge
+            positive_edge = user_positive_edges[:, torch.randint(0, user_positive_edges.shape[1], (1,))]
+            # randomly select 5 negative edges
+            negative_edges = user_negative_edges[:, torch.randint(0, user_negative_edges.shape[1], (5,))]
+            user_edges = torch.cat((positive_edge, negative_edges), dim=1)
+            # get the rankings of the positive and negative edges
+            user_rankings = model(user_edges.cuda())
+            del user_edges
+            torch.cuda.empty_cache()
+            # compute the loss
+            positive_rankings = user_rankings[0].unsqueeze(0).repeat(5)
+            negative_rankings = user_rankings[1:]
+            all_positive_rankings = torch.cat((all_positive_rankings, positive_rankings))
+            all_negative_rankings = torch.cat((all_negative_rankings, negative_rankings))
+        # compute the loss
+        loss = model.recommendation_loss(all_positive_rankings, all_negative_rankings, REG)
+        del all_positive_rankings
+        del all_negative_rankings
+        torch.cuda.empty_cache()
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        writer.add_scalar("Loss/train", loss, epoch * (num_train_users // BATCH_SIZE) + start_idx // BATCH_SIZE)
+    if epoch % 1 == 0:
+        # evaluate the model
+        model.eval()
+        # iterate over all users in the validation set
+        validation_users = list(set([int(x) for x in validation_edges[0, :]]))
+        # randomly select 1000 of the users
+        average_val_loss = 0
+        for i in range(3):
+            validation_users = random.sample(validation_users, min(len(validation_users), 32))
+            mean_ndcg = 0
+            ndcg_scores = []
+            validation_positive_edges = validation_graph.edge_index[:, validation_graph.edge_attr >= 3.5]
+            validation_negative_edges = validation_graph.edge_index[:, validation_graph.edge_attr <= 2.5]
+            val_positive_rankings = torch.tensor([]).cuda()
+            val_negative_rankings = torch.tensor([]).cuda()
+            for user in tqdm(validation_users):
+                user_id = id_to_user[user]
+                relevant_reviews = validation_df[validation_df['user_id'] == user_id]
+                user_validation_edges = validation_edges[:, validation_edges[0] == user]
+                user_validation_edges = user_validation_edges.to(device)
+                user_rankings = model(user_validation_edges).cpu()
+                user_validation_edges = user_validation_edges.cpu()
+                edges_sorted = list(user_validation_edges[1, user_rankings.argsort(descending=True)])
+                # use validation_df to get the relevances via the movie_id column and the movie_rating column
+                relevances = []
+                for edge in edges_sorted:
+                    movie_id = id_to_movie[int(edge)]
+                    if (movie_id in relevant_reviews['movie_id'].values):
+                        relevances.append(relevant_reviews[relevant_reviews['movie_id'] == movie_id]['movie_rating'].values[0])
+                    else:
+                        relevances.append(0)
+                # calculate the ndcg
+                if (len(relevances) >= K):
+                    ndcg = compute_ndcg_at_k(relevances, k=K)
+                if (math.isnan(ndcg)):
+                    print(relevant_reviews)
+                    input()
+                mean_ndcg += ndcg
+                ndcg_scores.append(ndcg)
+                user_positive_edges = validation_positive_edges[:, validation_positive_edges[0] == user]
+                user_negative_edges = validation_negative_edges[:, validation_negative_edges[0] == user]
+                if (user_positive_edges.shape[1] == 0 or user_negative_edges.shape[1] == 0):
+                    continue
+                positive_edge = user_positive_edges[:, torch.randint(0, user_positive_edges.shape[1], (1,))]
+                negative_edges = user_negative_edges[:, torch.randint(0, user_negative_edges.shape[1], (5,))]
+                all_edges = torch.cat([positive_edge, negative_edges], dim=1)
+                all_rankings = model(all_edges.cuda())
+                del all_edges
+                torch.cuda.empty_cache()
+                positive_rankings = all_rankings[0].unsqueeze(0).repeat(5)
+                negative_rankings = all_rankings[1:]
+                val_positive_rankings = torch.cat([val_positive_rankings, positive_rankings])
+                val_negative_rankings = torch.cat([val_negative_rankings, negative_rankings])
+                # calculate the validation loss
+            with torch.no_grad():
+                val_loss = model.recommendation_loss(val_positive_rankings, val_negative_rankings, REG)
+            del val_positive_rankings
+            del val_negative_rankings
+            torch.cuda.empty_cache()
+            average_val_loss += val_loss
+        writer.add_scalar("Loss/val", val_loss / 3, epoch * (num_train_users // BATCH_SIZE) + start_idx // BATCH_SIZE)
+        if (epoch % 2 == 0):
+            mean_ndcg = mean_ndcg / len(validation_users)
+            print("Standard Deviation: {}".format(np.std(ndcg_scores)))
+            # create a histogram of the ndcg scores, make bins for each 0.1
+            ndcg_scores = np.array(ndcg_scores).squeeze()
+            writer.add_histogram("hist_NDCG/val", ndcg_scores, epoch)
+            # also make a histogram in matplotlib and save as png
+            plt.hist(ndcg_scores, bins=np.arange(0, 1.1, 0.1))
+            plt.suptitle("Validation NDCG Histogram")
+            # write information about the model to the histogram
+            plt.title(f"Model: LightGCN, Embedding Dim: {EMBEDDING_DIM}, Num Layers: {NUM_LAYERS}, Batch Size: {BATCH_SIZE}, LR: {LR}, Num Train Users: {num_train_users}, Num Train Items: {num_train_items}", fontsize=8, wrap=True)
+            plt.xlabel("NDCG")
+            plt.ylabel("Frequency")
+            # save the figure in the hist_NDCG folder, with the title having the model information and the epoch number
+            plt.savefig(f"hist_NDCG/val_{EMBEDDING_DIM}_{NUM_LAYERS}_{BATCH_SIZE}_{LR}_{num_train_users}_{num_train_items}_{epoch}.png")
+            plt.close()
+            # Also save the raw NDCG scores to a csv file, with the model information in the title, and the epoch number
+            np.savetxt(f"hist_NDCG/val_{EMBEDDING_DIM}_{NUM_LAYERS}_{BATCH_SIZE}_{LR}_{num_train_users}_{num_train_items}_{epoch}.csv", ndcg_scores, delimiter=",")
+            print(mean_ndcg)
+            writer.add_scalar("NDCG", mean_ndcg.item(), epoch * (num_train_users // BATCH_SIZE) + start_idx // BATCH_SIZE)
+            recall_at_k = compute_recall_at_k(validation_graph, model, K)
+            print(recall_at_k)
+            writer.add_scalar("Recall@K/val", recall_at_k, epoch * (num_train_users // BATCH_SIZE) + start_idx // BATCH_SIZE)
+            print("Epoch: {}, NDCG: {}, Recall@{}: {}".format(epoch, mean_ndcg, K, recall_at_k))
+            average_number_of_matches = 0
+            for user_id in validation_users:
+                all_edges = torch.tensor([(user_id, item_id) for item_id in range(num_train_users, num_train_items)], dtype=torch.long).t().contiguous()
+                dst_index = torch.tensor([x for x in range(num_train_users + 1, num_train_items)]).to(device)
+                recommendations = model.recommend(all_edges.to(device), src_index=torch.tensor([user_id]).to(device), dst_index=dst_index, k=10)[0].cpu()
+                del all_edges
+                del dst_index
+                torch.cuda.empty_cache()
+                movie_names = [movie_id_to_movie_name[id_to_movie[int(recommendation)]] for recommendation in recommendations]
+                true_user_reviews = user_review_data[id_to_user[user_id]]
+                matches = 0
+                for movie_name in movie_names:
+                    if movie_name in true_user_reviews['movie_title'].values:
+                        matches += 1
+                average_number_of_matches += matches
+            average_number_of_matches = average_number_of_matches / len(validation_users)
+            print("Average number of matches: {}".format(average_number_of_matches))
+            writer.add_scalar("Average number of matches", average_number_of_matches, epoch * (num_train_users // BATCH_SIZE) + start_idx // BATCH_SIZE)
+            print("=====================================")
+    
+    scheduler.step()
